@@ -1,0 +1,176 @@
+################################################################################
+#
+# RevBayes Example: Bayesian inference of phylogeny using a Jukes-Cantor model
+#
+# This file: Runs the full MCMC on a single gene under the Jukes-Cantor
+#            substitution model using a rooted (birth-death) tree model.
+#
+# authors: Sebastian Hoehna, Tracy A. Heath, Michael Landis and Brian R. Moore
+#
+################################################################################
+
+if (!exists("int_seed")) "ERROR: `int_seed` undefined"
+if (!exists("n_state")) "ERROR: `n_state` undefined"
+if (!exists("data_file")) "ERROR: `data_file` undefined"
+if (!exists("tree_file")) "ERROR: `tree_file` undefined"
+if (!exists("mcmc_trees")) "ERROR: `mcmc_trees` undefined"
+if (!exists("mcmc_tune")) "ERROR: `mcmc_tune` undefined"
+if (!exists("mcmc_burn")) "ERROR: `mcmc_burn` undefined"
+if (!exists("mcmc_iter")) "ERROR: `mcmc_iter` undefined"
+
+
+#######################
+# Reading in the Data #
+#######################
+
+###### This just defines a single model for all sites #######
+### Read in sequence data for both genes
+seed(int_seed)
+data <- readCharacterDataDelimited(data_file, stateLabels=n_state, type="NaturalNumbers", delimiter="\t", headers=FALSE)
+#T <- readTrees(ini_tree_file)[1]
+data
+
+
+# Get some useful variables from the data. We need these later on.
+n_species <- data.ntaxa()
+taxa <- data.taxa()
+n_branches <- 2 * n_species - 3
+
+# set my move index
+mvi = 0
+mni = 0
+
+
+##############
+# Tree model #
+##############
+
+### the BDP is conditioned on the root time
+### here we fix it to 90 million year ago
+root_time <- 100
+
+### the birth rate is a stochastic random variable drawn from a lognormal prior
+### MCMC samples this variable using a scale proposal
+diversification_mean <- ln( ln(n_species/2.0) / root_time )
+diversification_sd <- 0.6*2
+diversification ~ dnLognormal(mean=diversification_mean,sd=diversification_sd)
+moves[++mvi] = mvScale(diversification,lambda=1.0,tune=true,weight=3.0)
+
+turnover_mean <- ln( ln(n_species/2.0) / root_time )
+turnover_sd <- 0.6*2
+turnover ~ dnLognormal(mean=turnover_mean,sd=turnover_sd)
+moves[++mvi] = mvScale(turnover,lambda=1.0,tune=true,weight=3.0)
+
+#birth_rate_mean <- ln( ln(n_species/2.0) / root_time )
+#birth_rate_sd <- 0.587405
+#birth_rate ~ dnLognormal(mean=birth_rate_mean,sd=birth_rate_sd)
+#moves[++mvi] = mvScale(birth_rate,lambda=1,tune=true,weight=3)
+
+### Transform the parameters
+birth_rate := diversification + turnover
+death_rate := turnover
+
+### rho is the probability of sampling species at the present
+### fix this to 23/450, since there are ~450 described species of primates
+### and we have sampled 23
+rho <- 1
+
+### the time tree is a stochastic node modeled by the constant rate birth-death process (dnBDP)
+psi ~ dnBDP(lambda=birth_rate,mu=death_rate,rho=rho,rootAge=root_time,samplingStrategy="uniform",condition="survival",taxa=taxa)
+#psi.setValue(T)
+
+moves[++mvi] = mvNarrow(psi, weight=5.0)
+moves[++mvi] = mvNNI(psi, weight=1.0)
+moves[++mvi] = mvFNPR(psi, weight=3.0)
+moves[++mvi] = mvGPR(psi, weight=3.0)
+moves[++mvi] = mvSubtreeScale(psi, weight=3.0)
+moves[++mvi] = mvNodeTimeSlideUniform(psi, weight=15.0)
+
+
+
+######################
+# Substitution Model #
+######################
+
+# n-1 rate classes
+for (i in 1:(n_state-1)) {
+    k[i] ~ dnExp(1)
+    k[i].setValue(n_state-i) # pretty starting values
+    moves[++mvi] = mvScale(k[i],lambda=1,tune=true,weight=3)
+}
+
+# populate the transition rates: 
+for (i in 1:n_state) {
+    for (j in i:n_state) {
+        if (i != j) {
+            r[i][j] := k[ j-i ]
+            r[j][i] := k[ j-i ]
+        } else {
+            r[i][i] <- 0.
+        }
+    }
+}
+
+Q := fnFreeK(r, rescaled=true)
+
+###################
+# Molecular clock #
+###################
+
+### We know from empirical estimates a clock rate which is 0.01 (=1%) per million years per site
+### Nevertheless, we will estimate it here because we fixed the root age
+### we use a uniform prior on the log-transform clock rate
+log_clock_rate ~ dnUniform(-6,2)
+moves[++mvi] = mvSlide(log_clock_rate, delta=1, tune=true, weight=2.0)
+clock_rate := 10^log_clock_rate
+
+
+
+###################
+# PhyloCTMC Model #
+###################
+
+# the sequence evolution model
+seq ~ dnPhyloCTMC(tree=psi, Q=Q, branchRates=clock_rate, type="NaturalNumbers")
+
+# attach the data
+seq.clamp(data)
+
+
+
+
+#############
+# THE Model #
+#############
+
+# We define our model.
+# We can use any node of our model as a handle, here we choose to use the rate matrix.
+mymodel = model(log_clock_rate)
+
+
+
+
+#############
+# Monitors  #
+#############
+
+
+monitors[++mni] = mnFile(filename=mcmc_trees, printgen=10, separator = TAB, psi, log_clock_rate, birth_rate, death_rate, k)
+# monitors[++mni] = mnFile(filename=mcmc_trees, printgen=10, separator = TAB, psi)
+monitors[++mni] = mnScreen(printgen=100, log_clock_rate, birth_rate, k)
+
+mymcmc = mcmc(mymodel, monitors, moves)
+
+mymcmc.burnin(generations=mcmc_burn,tuningInterval=mcmc_tune)
+mymcmc.run(generations=mcmc_iter)
+
+
+# Now, we will analyze the tree output.
+# Let us start by reading in the tree trace
+# treetrace = readTreeTrace(mcmc_trees, treetype="clock")
+# and get the summary of the tree trace
+# treetrace.summarize()
+# map_tree = mapTree(treetrace,tree_file)
+
+q()
+
